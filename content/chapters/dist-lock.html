@@ -1,0 +1,28 @@
+<!--chapter-meta
+{
+  "id": "dist-lock",
+  "line": "cache",
+  "title": "分布式锁选型：Redis、ZooKeeper 还是不用锁",
+  "order": 2,
+  "rounds": ["二面"],
+  "signal": "高",
+  "signal_note": "二面高频；最高级的答案是“这个场景不需要锁”",
+  "company": ["大厂", "中厂"],
+  "trigger": "定时任务多实例重复执行、防重复下单、抢占式消费",
+  "updated": "2026-11",
+  "status": "planned",
+  "summary": "先问临界区幂等吗，再选锁。幂等的临界区选轻锁，非幂等的上幂等键+fencing，最好的分布式锁经常是不需要锁。",
+  "keywords": ["分布式锁", "Redisson", "看门狗", "ZooKeeper", "RedLock", "fencing token", "幂等", "状态机"]
+}
+chapter-meta-->
+<h2>这一章要解决的生产问题</h2>
+<p>定时对账任务部署了 4 个实例，每晚重复执行 4 次。团队争论用 Redis 锁还是 ZK 锁——但没人先问：这个任务重复执行到底会怎样？</p>
+<h2>写作中</h2>
+<p>本章正在按样板章结构写作。计划覆盖的判断点：</p>
+<ul>
+  <li>前置判断：锁保护的临界区幂等吗？幂等临界区锁可以弱（重了只是浪费），非幂等临界区锁再强也不够（要幂等键 + fencing token / DB 约束）</li>
+  <li>Redis（Redisson 看门狗续期）vs ZK（临时节点 + 会话）的失败面：持锁者崩溃、锁超时误释放、时钟</li>
+  <li>RedLock 争议一句话：多实例多数派换不来想要的正确性，Martin Kleppmann 与 antirez 之争的工程结论</li>
+  <li>被否决选项的胜场：“不用锁”——幂等设计 + 状态机 + 乐观并发（version 列）常常是更稳的解</li>
+  <li>面试信号：开口先问“锁的是什么操作”而不是比较两个中间件，直接进入高级档</li>
+</ul>

@@ -1,0 +1,28 @@
+<!--chapter-meta
+{
+  "id": "lock-choice",
+  "line": "concurrency",
+  "title": "synchronized、ReentrantLock 还是 LongAdder：锁选型",
+  "order": 3,
+  "rounds": ["一面"],
+  "signal": "中",
+  "signal_note": "一面基础知识位；版本边界（偏向锁废弃）是加分点",
+  "company": ["大厂", "中厂"],
+  "trigger": "计数器热点、竞争激烈的并发结构、JDK 升级后性能变化",
+  "updated": "2026-11",
+  "status": "planned",
+  "summary": "锁升级原理背得再熟，也不如一张“竞争强度 × 操作类型”选型表。偏向锁都废弃了，你的答案还在用它吗？",
+  "keywords": ["synchronized", "ReentrantLock", "AQS", "LongAdder", "读写锁", "偏向锁", "锁升级", "无锁"]
+}
+chapter-meta-->
+<h2>这一章要解决的生产问题</h2>
+<p>监控埋点计数器用 synchronized Map，压测时成为热点；有人建议换 ConcurrentHashMap，有人建议 LongAdder——你需要的不只是答案，是选型依据。</p>
+<h2>写作中</h2>
+<p>本章正在按样板章结构写作。计划覆盖的判断点：</p>
+<ul>
+  <li>竞争强度三档选型：低竞争 synchronized（JIT 优化后足够）、高竞争读多写少 LongAdder/读写锁、需要条件队列/可中断/超时才上 AQS 系</li>
+  <li>版本边界：偏向锁 JDK 15 起废弃——旧面试题的“锁升级全链路”答案需要按版本重述</li>
+  <li>JIT 的礼物与陷阱：锁消除/粗化什么时候让你白忙一场（在无竞争代码上优化锁）</li>
+  <li>被否决选项的胜场：ReentrantLock 的 tryLock 超时在“避免死等”场景不可替代</li>
+  <li>面试信号：按“竞争强度 → 数据结构 → 版本”三层作答，而不是复述锁升级流程</li>
+</ul>

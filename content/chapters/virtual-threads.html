@@ -1,0 +1,28 @@
+<!--chapter-meta
+{
+  "id": "virtual-threads",
+  "line": "concurrency",
+  "title": "虚拟线程落地判断：哪些业务该换，哪些别动",
+  "order": 4,
+  "rounds": ["一面", "二面"],
+  "signal": "高",
+  "signal_note": "2025–2026 面经中增速最快的新题；版本视野的直接考察点",
+  "company": ["大厂", "中厂"],
+  "trigger": "JDK 21/25 升级评估、百万连接场景、线程池容量天花板",
+  "updated": "2026-11",
+  "status": "planned",
+  "summary": "虚拟线程不是“更好的线程池”。哪些服务换完吞吐翻倍、哪些白忙一场、哪些反而出 pin 事故——这是新版本的选型判断题。",
+  "keywords": ["虚拟线程", "Loom", "JDK 21", "JDK 25", "pin", "信号量", "ThreadLocal", "线程池"]
+}
+chapter-meta-->
+<h2>这一章要解决的生产问题</h2>
+<p>公司启动 JDK 21 升级，架构组问：哪些服务该顺手切虚拟线程？切错的服务可能出现 pin 导致吞吐不升反降。</p>
+<h2>写作中</h2>
+<p>本章正在按样板章结构写作。计划覆盖的判断点：</p>
+<ul>
+  <li>该换的画像：高并发 + 阻塞 IO + 任务短小（网关、爬取、消息消费）；不该动的画像：CPU 密集、依赖 synchronized 长临界区、重 ThreadLocal</li>
+  <li>两个反直觉：池化虚拟线程是反模式（限并发用信号量）；synchronized 块内阻塞会 pin 住载体线程（JDK 24/JEP 491 才解决）</li>
+  <li>迁移路径：检测（<code>-Djdk.tracePinnedThreads</code>）→ 局部试点 → 全量；与平台线程池共存的目标架构</li>
+  <li>被否决选项的胜场：传统平台线程池在 CPU 密集与资源隔离场景仍是正解</li>
+  <li>面试信号：能说出“虚拟线程省的是线程数，省不下兜底设计”直接对应高级档</li>
+</ul>

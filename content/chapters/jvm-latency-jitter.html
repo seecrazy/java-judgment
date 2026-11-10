@@ -1,0 +1,28 @@
+<!--chapter-meta
+{
+  "id": "jvm-latency-jitter",
+  "line": "jvm",
+  "title": "GC 正常但接口有毛刺：停顿的另外四个来源",
+  "order": 4,
+  "rounds": ["二面"],
+  "signal": "中",
+  "signal_note": "低延迟场景（交易/风控）岗位的二面区分题",
+  "company": ["大厂"],
+  "trigger": "P99 抖动但 GC 日志干净、定时性尖刺、容器环境偶发慢",
+  "updated": "2026-11",
+  "status": "planned",
+  "summary": "GC 日志干净、CPU 不高，P99 却周期性尖刺。停顿的世界比 GC 大得多：安全点、CPU 限流、IO 刷盘、页缺失。",
+  "keywords": ["毛刺", "safepoint", "安全点", "CFS throttling", "CPU 限流", "停顿", "P99"]
+}
+chapter-meta-->
+<h2>这一章要解决的生产问题</h2>
+<p>交易服务 P99 每 30 秒左右出现一次尖刺，GC 日志干净、CPU 平稳。监控一切正常的地方，恰恰藏着最难的性能问题。</p>
+<h2>写作中</h2>
+<p>本章正在按样板章结构写作。计划覆盖的判断点：</p>
+<ul>
+  <li>毛刺的分布判别法：周期性（定时任务 / 刷盘 / CFS 配额周期）vs 随机（页缺失 / 重传）对应完全不同的嫌疑名单</li>
+  <li>四个非 GC 来源：安全点（可数循环导致 reaching safepoint 慢）、容器 CPU 限流（cfs throttled 指标）、日志/监控刷盘、内存页换入</li>
+  <li>工具链：<code>-Xlog:safepoint</code>（11+）/ <code>PrintSafepointStatistics</code>（8）、cgroup 指标、火焰图的采样窗口选择</li>
+  <li>判断力核心：从“毛刺周期”反推“哪个子系统有同周期的行为”——先建立假设再用工具证实</li>
+  <li>面试信号：能主动说出“GC 只是停顿来源之一”就已经超过多数候选人</li>
+</ul>

@@ -1,0 +1,28 @@
+<!--chapter-meta
+{
+  "id": "mysql-lock-deadlock",
+  "line": "mysql",
+  "title": "死锁排查与事务边界：一次转账死锁复盘",
+  "order": 2,
+  "rounds": ["二面"],
+  "signal": "高",
+  "signal_note": "金融/支付岗位必问；RR 隔离级别与 gap lock 是追问深水区",
+  "company": ["大厂", "中厂"],
+  "trigger": "Deadlock found 日志、批处理与在线交易互锁、事务包太长",
+  "updated": "2026-11",
+  "status": "planned",
+  "summary": "死锁三疗法：固定加锁顺序、缩短事务、索引打准。判读 show engine innodb status 是基本功，理解 RR 下的 gap lock 才是分水岭。",
+  "keywords": ["死锁", "InnoDB", "gap lock", "next-key lock", "RR", "事务", "innodb status", "锁顺序"]
+}
+chapter-meta-->
+<h2>这一章要解决的生产问题</h2>
+<p>批量代扣任务一上线，在线转账立刻出现死锁告警。同一张表、两个事务、更新顺序相反——教科书式死锁，但修复方案有三个层次可选。</p>
+<h2>写作中</h2>
+<p>本章正在按样板章结构写作。计划覆盖的判断点：</p>
+<ul>
+  <li>判读 <code>SHOW ENGINE INNODB STATUS</code>：找到两个事务各自持有的锁与等待的锁，重建交错时序</li>
+  <li>RR 隔离级别下 gap lock / next-key lock 的范围：为什么“没匹配到行的查询”也会锁住一段区间（两个空范围插入互锁）</li>
+  <li>三疗法与代价：固定顺序（需要梳理全部入口）、短事务（把 RPC/文件 IO 移出事务）、索引打准（扫描范围即锁范围）</li>
+  <li>被否决选项的胜场：降级到 RC 可以消掉大部分 gap lock，但代价是幻读语义与主从一致性假设要重新审</li>
+  <li>面试信号：死锁告警阈值不该设为 0 而是“趋势上升”——说出这句说明真运维过</li>
+</ul>

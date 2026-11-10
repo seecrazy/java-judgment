@@ -1,0 +1,28 @@
+<!--chapter-meta
+{
+  "id": "jvm-memory-leak",
+  "line": "jvm",
+  "title": "堆没用满却在 OOM：一次堆外内存泄漏定位",
+  "order": 2,
+  "rounds": ["一面", "二面"],
+  "signal": "中",
+  "signal_note": "中厂常问 NIO/Netty 场景；大厂作为 GC 章的追问延伸",
+  "company": ["大厂", "中厂"],
+  "trigger": "RSS 持续上涨但堆监控正常、容器 OOMKilled、Netty/DirectByteBuffer 使用方",
+  "updated": "2026-11",
+  "status": "planned",
+  "summary": "堆监控一切正常，进程 RSS 却一路涨到被容器 OOMKilled。OOM 不一定是堆——堆外内存的定位链路完全不同。",
+  "keywords": ["OOM", "堆外内存", "DirectByteBuffer", "Netty", "NMT", "元空间", "OOMKilled"]
+}
+chapter-meta-->
+<h2>这一章要解决的生产问题</h2>
+<p>网关服务堆用量平稳，容器内存却每周稳定上涨，最终被 K8s OOMKilled。jmap 看堆干干净净——问题根本不在堆里。</p>
+<h2>写作中</h2>
+<p>本章正在按样板章结构写作（场景 → 判断框架 → 回到工位 → 面试怎么答 → 追问链）。计划覆盖的判断点：</p>
+<ul>
+  <li>OOM 的分类学：堆 / 元空间 / 直接内存 / 栈 / 容器 cgroup——先分清是哪种，再谈定位</li>
+  <li>DirectByteBuffer 为什么不受 GC 直接管理（引用计数 vs GC 感知），Netty PoolArena 与 <code>-XX:MaxDirectMemorySize</code> 的关系</li>
+  <li>诊断链路：NMT（<code>jcmd VM.native_memory</code>）、pmap、按段排除（glibc arena / 线程栈 / CodeCache）</li>
+  <li>被否决选项的胜场：“重启大法”作为止血手段的正当性与限度</li>
+  <li>面试分层信号：能说出“OOM 不一定是堆”是分水岭，能讲 NMT baseline 对比是加分</li>
+</ul>

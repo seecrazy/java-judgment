@@ -1,0 +1,92 @@
+<!--chapter-meta
+{
+  "id": "jvm-g1-fullgc",
+  "line": "jvm",
+  "title": "G1 频繁 Full GC：P99 从 80ms 涨到 2 秒",
+  "order": 1,
+  "rounds": ["一面", "二面"],
+  "signal": "高",
+  "signal_note": "大厂一/二面高频；中厂常以“线上事故复盘”形式出现",
+  "company": ["大厂", "中厂"],
+  "trigger": "接口毛刺、发布后变慢、大促容量不足、新接口上线当晚",
+  "updated": "2026-11",
+  "status": "done",
+  "summary": "大促预热当晚 P99 涨 25 倍，jstat 看到每两分钟一次 Full GC。不调参数不扩容，先读 GC 日志定死因——大对象分配打爆老年代。可带走一份 GC 日志判读表。",
+  "keywords": ["G1", "Full GC", "Humongous", "GC 日志", "jstat", "jcmd", "调优", "P99", "大对象", "to-space exhausted"]
+}
+chapter-meta-->
+<h2 id="scene">工作场景</h2>
+<p>周四晚八点，优惠券服务 P99 从 80ms 爬到 2s。CPU 不到 60%，日志无异常，当天没有发布。大促预热第一天，新上了“整店券”批量查询接口。<code>jstat -gcutil</code> 看到 FGC 每两分钟涨一次。可选路径：</p>
+<ul>
+  <li>A. 扩容 / 调大堆，先扛过今晚</li>
+  <li>B. 按经验模板调 G1 参数（IHOP、Region 大小）</li>
+  <li>C. dump 一份堆慢慢找泄漏</li>
+  <li>D. 先读 GC 日志，确认 Full GC 的触发类型再说</li>
+</ul>
+
+<h2 id="framework">判断框架</h2>
+<h3>第一步 · 约束</h3>
+<p>大促在跑，不能重启，扩容要走审批来不及——只能<strong>在线诊断</strong>。环境钉死：JDK 8 + G1，堆 8G。诊断手段必须零侵入：不能加重停顿，不能改启动参数。</p>
+<h3>第二步 · 选项与代价</h3>
+<p>A 调堆：如果是泄漏，只是延缓死亡；只有“容量确实不够”时才是正解。B 调参：对“并发标记跟不上分配”有效，对大对象洪峰无效——盲调等于改了自变量却不知道在测什么。C dump：8G 堆 dump 有 10 秒级停顿风险，大促峰值绝不能做，且落盘 8G 可能打满磁盘。D 读日志：零风险，且能直接淘汰前三个选项里的错误答案。<strong>判断力的第一刀永远是先诊断后动手：宁可花十分钟确认死因，不花一小时猜测病因。</strong></p>
+<h3>第三步 · 押注</h3>
+<p>选 D。GC 日志里每次 Full GC 前都有一串 <code>Humongous Allocation</code> 触发的并发周期和 <code>to-space exhausted</code>。算一下：8G 堆 / 2048 个 Region ≈ 4M 一个 Region，大对象阈值是 Region 的一半 = 2M。而“整店券”接口一次组装 40MB 的商品列表——每个请求都在把 2M 以上的数组直接怼进老年代，分配速率远超并发标记回收能力，老年代被打爆，触发 Full GC。JDK 8 的 G1 Full GC 是<strong>单线程</strong>的，一次几秒——这就是 P99 变 2s 的机制。</p>
+<p>真正的动作在业务侧：当晚接口限流止血，一周内改分页 + 流式组装。</p>
+<h3>第四步 · 复盘</h3>
+<p>P99 回到 90ms。沉淀两条：大促新增接口进“对象分配评估”清单（单次响应组装对象超过多少要过评审）；GC 日志从“出了事才开”改为<strong>常开 + 采集</strong>——这次能十分钟定位，靠的就是日志已经在那。</p>
+<h3>被否决选项的胜场</h3>
+<p>“调大堆”这次没做，但它不是永远错误：如果日志显示的是活跃数据缓慢健康增长（缓存预热、真实容量上量），调堆 + 同步调 IHOP 就是教科书答案。否决它的理由不是“调堆不好”，而是<strong>这次的病因是分配速率，不是容量</strong>。能把这句话说清楚，才算懂调优。</p>
+
+<h2 id="desk">回到工位</h2>
+<div class="desk">
+<p><strong>明天上班，对你自己的服务跑这三条命令</strong>（JDK 8 与 11+ 的日志开关都给了），把结论记到团队文档里：</p>
+<ol>
+  <li><code>jps</code> 拿到 pid，然后 <code>jstat -gcutil &lt;pid&gt; 1000</code> 连看 10 行——FGC 列涨不涨？多久一次？</li>
+  <li><code>jcmd &lt;pid&gt; GC.heap_info</code>——Region 多大（推算你们的大对象阈值）、老年代占用、有没有 humongous region 数量。</li>
+  <li>确认 GC 日志开着：8 用 <code>-XX:+PrintGCDetails -Xloggc:gc.log</code>，11+ 用 <code>-Xlog:gc*:file=gc.log</code>。没开的话，把它加进下次发布的启动参数。</li>
+</ol>
+<p>然后对照这张<strong>GC 日志判读表</strong>看一眼：</p>
+<table>
+  <tr><th>日志特征</th><th>含义</th><th>第一动作</th></tr>
+  <tr><td><code>Full GC (Allocation Failure)</code></td><td>老年代真满：泄漏或容量不足</td><td>低峰期 dump / 间隔对比 class histogram</td></tr>
+  <tr><td>频繁 <code>Humongous Allocation</code></td><td>大对象直接进老年代</td><td>找大对象来源：新接口、大报文、批任务</td></tr>
+  <tr><td><code>to-space exhausted</code> / Evacuation Failure</td><td>并发标记跟不上分配速率</td><td>提前 IHOP 或重新评估容量</td></tr>
+  <tr><td>Metadata / Class 相关 Full GC</td><td>类加载泄漏（动态代理、脚本引擎）</td><td>查 ClassLoader 数量与增长</td></tr>
+</table>
+</div>
+
+<h2 id="interview">面试怎么答</h2>
+<h3>面试官的三种问法</h3>
+<ul>
+  <li>“讲一次你定位 GC 问题的完整经历。”（最常见，考叙事结构和真实度）</li>
+  <li>“G1 什么时候会 Full GC？怎么避免？”（考原理，但高分在案例）</li>
+  <li>“你的服务大促前怎么防被打挂？”（考体系化：容量、评审、预案）</li>
+</ul>
+<h3>好回答的结构</h3>
+<p>现象（数字）→ 诊断路径（先看什么、为什么先看它）→ 定位（一句话机制）→ 决策（<strong>为什么不做 X</strong>）→ 结果（数字）→ 沉淀（流程变化）。60 秒内讲完。</p>
+<blockquote><p>60 秒示范：“大促预热当晚，券服务 P99 从 80ms 涨到 2s，jstat 看到每两分钟一次 Full GC。我没先动参数——先开 GC 日志确认死因：每次 Full GC 前都是成串的 Humongous Allocation 和 to-space exhausted。8G 堆、4M Region、大对象阈值 2M，而当晚新上的整店券接口一次组装 40MB 列表，等于每个请求都往老年代直接塞大对象；JDK 8 的 G1 Full GC 又是单线程的，一次几秒。所以动作在业务侧：限流、分页、流式组装，一周后 P99 回到 90ms。调堆这个选项我评估过没做——它是容量问题的解，不是分配速率问题的解。沉淀是大促新接口加了对象分配评审项。”</p></blockquote>
+<h3>翻车回答</h3>
+<ul>
+  <li>上来背 G1 原理三分钟，没有一次自己的经历——面试官立刻降档为“背过的”。</li>
+  <li>“我调大了内存就好了”——没有诊断过程，无法区分是容量还是泄漏，等于承认是蒙的。</li>
+  <li>把 JDK 8 的经验当普适：不知道 10+ 的 G1 Full GC 已并行化、21 起 ZGC 分代——版本边界说不清，二面直接扣分。</li>
+</ul>
+<p class="drill-hint">AI 破绽自查：你的回答里有没有一个具体数字、一句“我们当时没做 X”？没有的话，背的就是 AI 答案。</p>
+
+<h2 id="drill">追问链</h2>
+<p class="drill-hint">先自己心里答 10 秒，再展开对照。追问才是高级面试真正的战场。</p>
+<details>
+<summary>追问一：当时为什么不直接 jmap dump 一份堆？</summary>
+<p><strong>考察意图：</strong>生产代价意识——高级工程师对每个诊断动作的副作用有敬畏。</p>
+<p><strong>答到什么程度算过关：</strong>三层：① 8G 堆 dump 有 10 秒级 STW，大促峰值等于主动制造事故；② dump 落盘 8G 可能打满磁盘、且含敏感数据；③ 正确位次是先用零侵入手段（jstat / jcmd / 已有 GC 日志）排除到只剩“必须看堆”时，<strong>低峰期</strong>在<strong>副本</strong>上 dump。能补一句“事后复盘我们就是低峰期 dump 验证了大对象来源”，满分。</p>
+</details>
+<details>
+<summary>追问二：Humongous 的阈值是多少？怎么算出来的？</summary>
+<p><strong>考察意图：</strong>原理深度——是真调过还是背博客。</p>
+<p><strong>答到什么程度算过关：</strong>Region 大小 = 堆大小 / 2048，向下取 2 的幂，范围 1M~32M（可用 <code>-XX:G1HeapRegionSize</code> 显式定）；大对象 = 占半个 Region 及以上。所以 8G 堆 → 4M Region → 2M 阈值。再往深一层：业务含义是“单次组装超过阈值的数组/大字符串都会跳过 Young 区直接进老年代”，所以<strong>大报文、全量列表接口是 G1 的天然敌人</strong>，要么拆小，要么显式调大 Region。</p>
+</details>
+<details>
+<summary>追问三：JDK 8 的 G1 Full GC 和新版本有什么区别？如果让你评估升 17/21，你怎么判断？</summary>
+<p><strong>考察意图：</strong>版本视野——判断你是“跟着约束走”还是“跟着 API 走”。</p>
+<p><strong>答到什么程度算过关：</strong>① JDK 8 的 G1 Full GC 单线程（秒级停顿），JDK 10 起并行化（JEP 307），同样的故障在新版本停顿小一个量级；② 容器内存感知、默认 GC、移除的 JVM 选项在 8→17 都有变化；③ 升级评估是工程决策不是 GC 单点决策：依赖兼容（反射、内部 API、移除的选项）、全量回归压测、灰度回滚方案；④ 到 17/21 再看 ZGC 的取舍——停顿更优但吃内存吃 CPU，吞吐型服务未必划算。结论落在“先量化我们自己的停顿 SLA，再选版本和收集器”。</p>
+</details>

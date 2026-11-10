@@ -1,0 +1,28 @@
+<!--chapter-meta
+{
+  "id": "jvm-collector-choice",
+  "line": "jvm",
+  "title": "收集器选型：Parallel、G1、ZGC 什么时候换",
+  "order": 5,
+  "rounds": ["一面", "二面"],
+  "signal": "中",
+  "signal_note": "版本敏感题；升级评估类岗位（平台/中间件）高频",
+  "company": ["大厂", "中厂"],
+  "trigger": "JDK 升级评估、新服务技术选型、停顿 SLA 定不下来",
+  "updated": "2026-11",
+  "status": "planned",
+  "summary": "“换 ZGC 吧”经常是错的第一步。收集器选型只有三个问题：停顿 SLA 是多少、堆多大、愿意付多少吞吐和内存。",
+  "keywords": ["G1", "ZGC", "Parallel", "收集器", "选型", "JDK 17", "JDK 21", "分代 ZGC"]
+}
+chapter-meta-->
+<h2>这一章要解决的生产问题</h2>
+<p>团队新起一个交易服务，有人说“直接 ZGC，停顿才零点几毫秒”。选型会上没人说得清：我们真的需要付出 ZGC 的代价吗？</p>
+<h2>写作中</h2>
+<p>本章正在按样板章结构写作。计划覆盖的判断点：</p>
+<ul>
+  <li>三个设计目标与代价：Parallel（吞吐优先，停顿大）、G1（停顿可控，吃 CPU 做并发）、ZGC（超低停顿，吃内存与吞吐，21 起分代成熟）</li>
+  <li>选型三问：停顿 SLA 数字是多少？堆多大（ZGC 的内存放大）？业务是吞吐型还是延迟型？</li>
+  <li>版本边界：JDK 8 默认 Parallel、11+ 默认 G1、21 分代 ZGC、24 解决 synchronized pin——什么时候“不升级”也是对的</li>
+  <li>被否决选项的胜场：批处理服务用 Parallel 吞吐反而最高——“先进收集器”不是通用升级</li>
+  <li>面试信号：押注一个并说代价，比“都行看场景”高级</li>
+</ul>

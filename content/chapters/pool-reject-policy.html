@@ -1,0 +1,86 @@
+<!--chapter-meta
+{
+  "id": "pool-reject-policy",
+  "line": "concurrency",
+  "title": "拒绝策略选错，订单丢了：线程池参数背后的业务问题",
+  "order": 1,
+  "rounds": ["一面", "二面"],
+  "signal": "高",
+  "signal_note": "社招一/二面必考问法之一；大厂常直接问“你的队列长度为什么是这个数”",
+  "company": ["大厂", "中厂"],
+  "trigger": "异步任务丢失、洪峰时段数据不一致、OOM 疑似线程池、新服务定线程池参数",
+  "updated": "2026-11",
+  "status": "done",
+  "summary": "大促第二天 37 笔支付成功未发货：线程池模板里的 DiscardPolicy 洪峰时静默丢单。核心认知：拒绝策略选型是业务容忍度问题，不是技术问题。附自查表。",
+  "keywords": ["线程池", "拒绝策略", "DiscardPolicy", "CallerRunsPolicy", "AbortPolicy", "队列", "OOM", "newFixedThreadPool", "MQ 削峰", "对账"]
+}
+chapter-meta-->
+<h2 id="scene">工作场景</h2>
+<p>大促第二天，客服收到 37 笔“支付成功但没发货”的工单。排查两小时定位到：履约回调走线程池异步落库，队列 200，拒绝策略是同事从老模板抄来的 <code>DiscardPolicy</code>——洪峰时段 37 条任务被静默丢弃，没有日志、没有告警、没有补偿。可选路径：</p>
+<ul>
+  <li>A. 换 <code>CallerRunsPolicy</code>，提交线程自己跑，天然反压</li>
+  <li>B. 换 <code>AbortPolicy</code> 抛异常，靠上游重试</li>
+  <li>C. 有界队列 + 落 MQ，线程池只做消费侧并行</li>
+  <li>D. 把队列加大，先顶过去</li>
+</ul>
+
+<h2 id="framework">判断框架</h2>
+<h3>第一步 · 约束</h3>
+<p>资金链路，一条都不能丢。回调方是支付网关，<strong>重试 3 次后不再补发</strong>——所以“抛出去让上游兜底”存在兜底上限。可接受分钟级延迟。这条约束直接决定：任何“静默”策略出局。</p>
+<h3>第二步 · 关键认知</h3>
+<p>拒绝策略选型不是技术题，是<strong>业务容忍度题</strong>。先回答两个问题：<strong>丢得起吗？谁来兜底？</strong>丢不起 + 上游重试有限，剩下的选项都在比“兜底放在哪一层”——本地队列、上游重试、MQ、对账。技术选型只是把这个业务答案翻译成架构。</p>
+<h3>第三步 · 选项与代价</h3>
+<p>A 反压有效，但拒绝发生在提交线程上——如果提交者是 Tomcat 工作线程，等于把异步退化成同步，Web 层被整体拖住。B 依赖上游重试：上游重试有限且重试会加剧洪峰。C 多一跳 MQ、运维复杂度上升，但换来削峰、重放、死信、顺序能力——对丢不起的数据，这些不是可选项，是必需品。D 大/无界队列只是把爆炸从“丢数据”改写成“OOM”（参考 <code>newFixedThreadPool</code> 的 <code>Integer.MAX_VALUE</code> 队列），更隐蔽。</p>
+<h3>第四步 · 押注与复盘</h3>
+<p>选 C，同时补三件事：① 全局清理所有 <code>DiscardPolicy</code>；② 拒绝、死信接告警——<strong>静默是事故的第一特征</strong>；③ 上对账 job 兜底，任何异步链路的最终兜底必须是核对，不是信任。三个月后复盘：MQ 死信累计 4 次、全部人工处理成功，对账拦下 1 次上游漏发——证明兜底层次是必要的。</p>
+<h3>被否决选项的胜场</h3>
+<p><code>CallerRunsPolicy</code> 在“丢得起、怕的是下游被压垮、提交者是自己人”的场景——日志上报、非关键埋点、内部批处理——反而是最优雅的解：零新增依赖的反压。这次不用，是因为业务丢不起。把“什么时候它是对的”说清楚，比说“它不行”高级得多。</p>
+
+<h2 id="desk">回到工位</h2>
+<div class="desk">
+<p><strong>明天上班，盘一遍你项目里所有线程池。</strong>先 grep 出来：</p>
+<p><code>grep -rn "new ThreadPoolExecutor\|Executors\.\|@Async\|new Timer" --include="*.java" .</code></p>
+<p>对每个线程池填这张表，填不出的格子就是风险点：</p>
+<table>
+  <tr><th>线程池</th><th>用途</th><th>丢得起吗（业务标注）</th><th>队列有界？界是多少、为什么</th><th>拒绝后：日志？告警？谁兜底？</th></tr>
+  <tr><td>fulfill-callback</td><td>履约落库</td><td>一条不能丢</td><td>有界 200，按洪峰 × 处理速率推的</td><td>落 MQ 死信 + 对账 job</td></tr>
+  <tr><td>log-report</td><td>日志上报</td><td>可丢</td><td>有界 1000</td><td>CallerRuns + 超限计数</td></tr>
+</table>
+<p>再补一刀：<code>submit()</code> 的异常会被 <code>Future</code> 吃掉。检查所有 <code>submit</code> 的调用处有没有 <code>get()</code> 或异常处理，没有就改成 <code>execute</code> + <code>UncaughtExceptionHandler</code>，否则下一颗静默炸弹就在那。</p>
+</div>
+
+<h2 id="interview">面试怎么答</h2>
+<h3>面试官的三种问法</h3>
+<ul>
+  <li>“线程池的核心参数有哪些？你是怎么定的？”（一面标配）</li>
+  <li>“四种拒绝策略分别什么时候用？”（考的不是背诵是分类标准）</li>
+  <li>“讲一次线程池引发的生产问题。”（二面高频，考复盘能力）</li>
+</ul>
+<h3>好回答的结构</h3>
+<p>先说业务容忍度，再说参数：<strong>先定“丢不丢得起”，再定队列与拒绝策略，最后用压测校准线程数。</strong>线程数公式（CPU 密集 ≈ N+1；IO 密集 ≈ N × (1 + 等待/计算)）只配当起点——真实值必须压出来，并说清楚怎么压的：什么工具、什么水位、看什么指标（吞吐、队列延迟、上下文切换）。</p>
+<blockquote><p>60 秒示范：“我们履约链路出过一次丢单：线程池模板里带的是 DiscardPolicy，大促洪峰 37 条落库任务被静默丢掉，两天后才发现。复盘定了一条原则——拒绝策略选型先问业务‘丢得起吗、谁兜底’。履约是资金链路丢不起，所以最终改成 MQ 削峰 + 消费端幂等 + 死信告警 + 对账 job 四层兜底，线程池只负责消费并行度。CallerRuns 我没选，因为提交线程是 Tomcat 工作线程，会把异步退化成同步拖垮 Web 层——但它在我们日志上报那个池子里是对的，那边丢得起。三个月后死信 4 次、对账拦了 1 次，证明层次是必要的。”</p></blockquote>
+<h3>翻车回答</h3>
+<ul>
+  <li>流利背出 7 个参数，被问“你们队列为什么是 200”时卡住——暴露从没为自己的参数负责过。</li>
+  <li>“用 AbortPolicy，因为是默认”——默认值不是理由。</li>
+  <li>“加机器/加队列顶过去”——把容量问题写成 OOM，方向反了。</li>
+</ul>
+<p class="drill-hint">AI 破绽自查：AI 会把四种策略各夸一遍让你自己挑。真实工程师必须当场押注一个，并说出自己项目里每个池子的选择。</p>
+
+<h2 id="drill">追问链</h2>
+<p class="drill-hint">先自己心里答 10 秒，再展开对照。</p>
+<details>
+<summary>追问一：CallerRunsPolicy 为什么可能拖垮 Tomcat？</summary>
+<p><strong>考察意图：</strong>是否理解线程池是全局资源调度问题，而不是一个类。</p>
+<p><strong>答到什么程度算过关：</strong>拒绝发生在提交线程（HTTP worker）上，它转去执行任务期间无法服务其他请求；队列满 + 全体提交者被拉去干活 = Web 层整体变慢，上游连接堆积，级联超时。本质一句话：<strong>CallerRuns 是把反压传导给提交者</strong>——提交者是后台线程、能扛反压时它是解药；是 Tomcat 线程时它是毒药。能主动说出“所以我们查清每个池子的提交者是谁”，过关。</p>
+</details>
+<details>
+<summary>追问二：为什么阿里规约禁用 Executors 快捷工厂？</summary>
+<p><strong>考察意图：</strong>送分题，但看你是背规约还是懂原理。</p>
+<p><strong>答到什么程度算过关：</strong><code>newFixedThreadPool</code>/<code>newSingleThreadExecutor</code> 用无界队列，洪峰直接 OOM；<code>newCachedThreadPool</code> 线程数无上限，耗尽 OS 线程；另外线程名不可定制，线上 <code>jstack</code> 全是 pool-1-thread-N，排查靠猜。高级答法落到工程原则：“我对所有池子要求三件套——<strong>显式容量、命名线程工厂、拒绝与队列指标接监控</strong>”，把规约升级成自己的实践。</p>
+</details>
+<details>
+<summary>追问三：JDK 21 虚拟线程之后，这套还要吗？</summary>
+<p><strong>考察意图：</strong>版本视野 + 方案是不是“跟着约束走”而不是“跟着 API 走”。</p>
+<p><strong>答到什么程度算过关：</strong>分三层。① 虚拟线程解决的是“阻塞 IO 占用平台线程”的瓶颈，<strong>不该池化</strong>（官方建议用信号量限并发，而不是复用）；② 平台线程池仍有位置：CPU 密集任务、需要隔离的稀缺资源（连接池本身）；③ 这章的架构判断——MQ 削峰、幂等、死信、对账——与线程模型无关，虚拟线程一个字都改不了它。能说出“换线程模型省下的是线程数，省不下兜底设计”，这题就是加分题。</p>
+</details>
