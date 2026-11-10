@@ -275,7 +275,7 @@ def build(out_dir):
         ACCENT="#2f6fed",
         ROUNDS="".join(round_blocks),
         LINES="".join(line_cards),
-        TOTAL="%d 篇样板章全文 · %d 章已纳入规划" % (done_total, len(chapters)),
+        TOTAL="%d / %d 章全文完成" % (done_total, len(chapters)),
         UPDATED=SITE_UPDATED,
     ))
     (out_dir / "index.html").write_text(page, encoding="utf-8")
