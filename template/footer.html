@@ -1,0 +1,18 @@
+<footer class="site-foot">
+  <div class="wrap">
+    <p>《Java 高级判断力：从能写到敢做决定》· 每个场景：工作中知道怎么选，面试时知道怎么说。</p>
+    <p>内容整理于 {{UPDATED}} · 技术结论均标注版本边界 · <a href="{{INDEX_PREFIX}}method.html#ai">别背 AI 答案</a></p>
+  </div>
+</footer>
+<script src="{{ASSET_PREFIX}}assets/app.js"></script>
+<script type="module">
+  try {
+    const m = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs');
+    m.default.initialize({
+      startOnLoad: true,
+      theme: document.documentElement.dataset.theme === 'dark' ? 'dark' : 'neutral',
+    });
+  } catch (e) { /* 离线时不渲染图，正文仍完整 */ }
+</script>
+</body>
+</html>

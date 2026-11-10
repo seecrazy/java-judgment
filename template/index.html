@@ -1,0 +1,43 @@
+{{HEADER}}
+<main class="wrap">
+  <section class="hero">
+    <h1>Java 高级判断力<span class="hero-sub">从能写到敢做决定</span></h1>
+    <p class="hero-tag">高级面试筛的不是"知不知道"，是"为什么选这个、为什么不选那个、出过什么问题"——<br>这恰好也是工作中拉开差距的能力。所以这里每个场景同时给你两样东西：<strong>工作中的决策清单，面试里的回答框架。</strong></p>
+    <div class="hero-search">
+      <input id="q" type="search" placeholder="搜关键词：G1 / 拒绝策略 / 击穿 / 死锁 / 秒杀 …（按 / 聚焦）" autocomplete="off">
+      <div id="results" class="results" hidden></div>
+    </div>
+    <p class="hero-meta">面向 3~8 年 Java 工程师 · {{TOTAL}} · 更新 {{UPDATED}}</p>
+  </section>
+
+  <section class="howto">
+    <h2>这本书怎么用</h2>
+    <ol>
+      <li><strong>手头有具体问题</strong> → 从下方"入口 B"进，按性能/并发/缓存/数据库/架构找到场景。</li>
+      <li><strong>面试前两周</strong> → 从"入口 A"进，按一面/二面/系统设计面过一遍，每章先做"回到工位"再背回答。</li>
+      <li>读章顺序固定：<strong>工作场景 → 判断框架 → 回到工位（动手）→ 面试怎么答 → 追问链</strong>。动手放在面试话术之前，因为扛得住追问的答案只能来自你真的做过。</li>
+    </ol>
+  </section>
+
+  <section id="entry-interview" class="entry-block">
+    <h2>入口 A · 按面试准备</h2>
+    <p class="entry-note">按轮次选章。灰色的"写作中"章节已规划、正在按样板结构写。</p>
+    <div class="round-grid">
+    {{ROUNDS}}
+    </div>
+  </section>
+
+  <section id="entry-work" class="entry-block">
+    <h2>入口 B · 按工作场景</h2>
+    <p class="entry-note">按你手头的问题选主线，同一个批章节，只是导航路径不同。</p>
+    <div class="line-grid">
+    {{LINES}}
+    </div>
+  </section>
+
+  <section class="diff">
+    <h2>这本书不是什么</h2>
+    <p>不是知识点大全——<em>advanced-java</em>、JavaGuide 已经足够好，背知识点不缺一个地方。这里只做一件事：把"工作中的判断"和"面试里的表达"之间的那层纸捅破——<strong>你在工作中做过的那个决策，怎么讲才能被认可为"高级"。</strong></p>
+  </section>
+</main>
+{{FOOTER}}
