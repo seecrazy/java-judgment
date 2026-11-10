@@ -10,19 +10,101 @@
   "company": ["大厂"],
   "trigger": "P99 抖动但 GC 日志干净、定时性尖刺、容器环境偶发慢",
   "updated": "2026-11",
-  "status": "planned",
-  "summary": "GC 日志干净、CPU 不高，P99 却周期性尖刺。停顿的世界比 GC 大得多：安全点、CPU 限流、IO 刷盘、页缺失。",
+  "status": "done",
+  "summary": "P99 每 30 秒尖刺到 400ms，GC 日志干净。停顿不止 GC：安全点、CFS 限流、刷盘、页缺失四源判读，从毛刺周期反推子系统。附分诊树。",
   "keywords": ["毛刺", "safepoint", "安全点", "CFS throttling", "CPU 限流", "停顿", "P99"]
 }
 chapter-meta-->
-<h2>这一章要解决的生产问题</h2>
-<p>交易服务 P99 每 30 秒左右出现一次尖刺，GC 日志干净、CPU 平稳。监控一切正常的地方，恰恰藏着最难的性能问题。</p>
-<h2>写作中</h2>
-<p>本章正在按样板章结构写作。计划覆盖的判断点：</p>
+<h2 id="scene">工作场景</h2>
+<p>交易服务 P99 基线 45ms，每 30 秒一次尖刺冲到 300~500ms，风控超时告警跟着闪。GC 日志干净：Young 20ms 以内、没有 Full，CPU 45%，堆平稳。环境 JDK 8 + G1，16G 堆，多实例同集群，改 JVM 参数要走变更窗口，今晚只能看不能改。可选路径：</p>
 <ul>
-  <li>毛刺的分布判别法：周期性（定时任务 / 刷盘 / CFS 配额周期）vs 随机（页缺失 / 重传）对应完全不同的嫌疑名单</li>
-  <li>四个非 GC 来源：安全点（可数循环导致 reaching safepoint 慢）、容器 CPU 限流（cfs throttled 指标）、日志/监控刷盘、内存页换入</li>
-  <li>工具链：<code>-Xlog:safepoint</code>（11+）/ <code>PrintSafepointStatistics</code>（8）、cgroup 指标、火焰图的采样窗口选择</li>
-  <li>判断力核心：从“毛刺周期”反推“哪个子系统有同周期的行为”——先建立假设再用工具证实</li>
-  <li>面试信号：能主动说出“GC 只是停顿来源之一”就已经超过多数候选人</li>
+  <li>A. 申请换 ZGC——治停顿</li>
+  <li>B. 把定时任务逐个关掉，二分验证</li>
+  <li>C. 先给毛刺画像：对齐时间轴，找与尖刺同周期的子系统</li>
+  <li>D. 上全链路追踪，顺手扩容</li>
 </ul>
+
+<h2 id="framework">判断框架</h2>
+<h3>第一步 · 约束</h3>
+<p>交易链路，今晚零变更权限，只能读已有指标和日志；多实例部署，可以对比“单实例还是全集群同时尖刺”这个免费信息。先说结论性的认知：<strong>GC 只是停顿来源之一</strong>。停顿的另外四个来源是：安全点到达慢（TTSP）、容器 CPU 限流、日志与刷盘 IO、内存页缺失换页。</p>
+<h3>第二步 · 关键认知：分布判别法</h3>
+<p>毛刺的时间分布就是第一份证据：<strong>严格周期、且多实例同一时刻</strong>——全局定时行为（监控采集、定时任务、刷盘、配额周期）；<strong>随机、且只在单实例</strong>——单机环境问题（页缺失、换页、THP 压缩、网络重传）。先用时间轴对齐把嫌疑名单从十几个砍到两三个，再动工具。</p>
+<h3>第三步 · 选项与代价</h3>
+<p>A 换 ZGC：治的是 GC 停顿，但 GC 日志显示总停顿只有 20ms 且不在尖刺时刻——药不对症；而且 8 上根本没有 ZGC，升级是大工程。B 二分关任务：每次尝试都是一次生产变更，一轮半天起步，而且“关掉就好了”不等于知道机理，下次换个任务复发。C 画像：零变更，只读时间戳。D 扩容：尖刺与 QPS 完全无关，扩容只会稀释信号还花钱。</p>
+<h3>第四步 · 押注</h3>
+<p>选 C。把 P99 曲线与监控指标对齐，两个事实浮出：尖刺严格落在每 30 秒的采集点、全集群各实例同一秒——全局定时行为，嫌疑锁定自研监控 agent 和指标快照。开 <code>-XX:+PrintSafepointStatistics</code>（JDK 8；9 起移除，11+ 用 <code>-Xlog:safepoint</code>）：每 30 秒一条 ThreadDump 类 VM 操作，sync 一列约 300ms——发起安全点的操作本身不慢，<strong>慢在等所有线程到齐</strong>。再对时间轴：指标快照线程同一瞬间在跑 3000 万桶直方图聚合，可数 for 循环、循环体内没有任何方法调用——JDK 8 的可数循环内部没有安全点轮询点，全 JVM 都在等它。修复两刀：循环每 65536 次迭代拆一块制造轮询机会；agent 抓线程栈从 30 秒降频到 5 分钟并逐步换 JFR。尖刺消失，P99 回到 47ms。附带版本边界：JDK 10 起 C2 对标准形态的可数循环做 strip mining，这类问题已大幅缓解但未绝迹（是否覆盖以你们版本实测为准），11+ 直接看 -Xlog:safepoint 的 Reaching 一列。</p>
+<h3>第五步 · 复盘</h3>
+<p>safepoint 日志常开进 JVM 模板；监控组件自身的开销纳入变更评审——<strong>监控不是免费的</strong>，这次的“凶手”就是监控系统自己的线程抓栈。排查卡沉淀为一张四源判读表。</p>
+<h3>被否决选项的胜场</h3>
+<p>换 ZGC 在“尖刺时刻真与 GC 对齐、且 SLA 要求个位数毫秒停顿”时就是正解，JDK 21 分代（JEP 439）后代价更小；二分关任务在没有任何时间轴工具的小团队是务实的第一招，快而直接；扩容在毛刺与流量确实相关（负载触顶、队列排队）时才对症——这次三者都输给了一张对齐的时间轴，因为它们都在治“没有确诊的病”。</p>
+<pre class="mermaid">
+flowchart TD
+  A["P99 周期性尖刺，GC 日志干净"] --> B{"尖刺严格周期且多实例同时刻？"}
+  B -- "是：全局定时行为" --> C{"和哪个子系统同周期？"}
+  C -- "监控采集 / 定时任务" --> D["safepoint 日志看 Reaching 或 sync 列"]
+  C -- "高频微冻结，随 CPU 密集出现" --> E["cpu.stat 看 CFS 限流"]
+  C -- "日志滚动 / 整点刷盘" --> F["IO 路径：异步化与预分配"]
+  B -- "否：随机且单实例" --> G["页缺失 / 换页 / THP / 网络重传"]
+  D --> H{"到达安全点耗时长吗？"}
+  H -- "是" --> I["找无轮询长循环，拆块制造 poll 点"]
+  H -- "否" --> J["wall-clock 火焰图 / JFR"]
+</pre>
+
+<h2 id="desk">回到工位</h2>
+<div class="desk">
+<p><strong>给自己的服务做一次毛刺画像，只要三步：</strong></p>
+<ol>
+  <li>导出最近一周 P99 曲线，看尖刺间隔：固定周期还是随机？固定 → 收集所有同周期子系统（@Scheduled 全局搜、crontab、监控采集间隔、日志滚动、K8s 探针）；随机 → 转 sar -B 看 majflt、swap、THP 设置。</li>
+  <li>打开两处常被忽略的可见性：safepoint（11+ 加 <code>-Xlog:safepoint:file=safepoint.log</code>，8 加 <code>-XX:+PrintSafepointStatistics</code>，盯 Reaching / sync 列，几十毫秒以上就有嫌疑循环）；容器限流（cgroup v1 看 /sys/fs/cgroup/cpu/cpu.stat 的 nr_throttled 与 throttled_time，v2 看 cpu.stat 的 throttled_usec；K8s 里是 container_cpu_cfs_throttled_periods_total 指标）。</li>
+  <li>日志路径体检：logback 是不是 AsyncAppender？同步 appender 碰上磁盘毛刺，请求线程会陪着 fsync 一起等。</li>
+</ol>
+<p>对照这张<strong>停顿四源判读表</strong>逐项过：</p>
+<table>
+  <tr><th>来源</th><th>典型指纹</th><th>证据在哪</th><th>第一动作</th></tr>
+  <tr><td>安全点到达慢（TTSP）</td><td>尖刺伴随 VM 操作，sync / Reaching 高</td><td>safepoint 日志</td><td>找无轮询长循环，拆块</td></tr>
+  <tr><td>容器 CPU 限流</td><td>尖刺周期贴近 CFS 配额周期，尾随突发流量</td><td>cpu.stat 的 throttled</td><td>调 quota / limit 等于 request / 绑核</td></tr>
+  <tr><td>日志与刷盘 IO</td><td>尖刺与滚动、归档、fsync 时刻吻合</td><td>iostat、应用日志时间戳</td><td>异步 appender、预分配文件</td></tr>
+  <tr><td>页缺失 / 换页</td><td>随机毛刺、单实例、majflt 或 swap 上涨</td><td>sar -B、/proc/vmstat</td><td>关 swap、THP 改 madvise 或 never</td></tr>
+</table>
+</div>
+
+<h2 id="interview">面试怎么答</h2>
+<h3>面试官的三种问法</h3>
+<ul>
+  <li>“GC 正常但接口有毛刺，你怎么查？”（本题，考停顿世界观）</li>
+  <li>“讲讲 safepoint，它什么时候会造成停顿？”（原理向）</li>
+  <li>“容器里的 JVM 延迟抖动，你关注哪些指标？”（视野向）</li>
+</ul>
+<h3>好回答的结构</h3>
+<p>先亮认知（GC 只是停顿来源之一）→ 分布判别（周期性还是随机）→ 对齐时间轴锁定子系统 → 证据（safepoint 日志的具体列）→ 修复与版本边界。让面试官听到“方法论”而不是“工具清单”。</p>
+<blockquote><p>60 秒示范：“交易服务 P99 基线 45ms，每 30 秒尖刺到 300~500ms，GC 日志干净。我先做毛刺画像：尖刺严格落在采集点、全集群同一秒，说明是全局定时行为而不是单机环境。JDK 8 开 PrintSafepointStatistics，每 30 秒一条 ThreadDump 操作、sync 列约 300ms——慢在等所有线程到齐；对时间轴发现指标快照在跑 3000 万桶的空循环体 for 循环，JDK 8 可数循环内部没有安全点轮询点，全 JVM 等它一个。修复是循环拆块加采集降频，P99 回到 47ms。换 ZGC 我评估过没做——GC 停顿只有 20ms 且不在尖刺时刻，药不对症；而且 JDK 10 起 strip mining 已经缓解这类问题，11+ 看 -Xlog:safepoint 就行。”</p></blockquote>
+<h3>翻车回答</h3>
+<ul>
+  <li>条件反射“调 GC 参数 / 换收集器”——问题根本不在 GC，暴露只会一招。</li>
+  <li>只知道 STW 不知道 TTSP——“GC 时间正常”不等于“停顿正常”，等所有人到齐的时间也在停顿里。</li>
+  <li>版本张冠李戴：在 JDK 17 上说用 PrintSafepointStatistics（9 起已移除，统一走 -Xlog）。</li>
+</ul>
+<p class="drill-hint">AI 破绽自查：AI 会把四个来源各写一段。你要能说出“这次是哪一个、怎么对时间轴锁定的、换 ZGC 为什么被否”。</p>
+
+<h2 id="drill">追问链</h2>
+<p class="drill-hint">先自己心里答 10 秒，再展开对照。</p>
+<details>
+<summary>追问一：什么是 TTSP？怎么量化它？</summary>
+<p><strong>考察意图：</strong>停顿模型的完整性——总停顿 = VM 操作本身 + 等所有线程到齐，第二项常被忽略。</p>
+<p><strong>答到什么程度算过关：</strong>TTSP 是 time-to-safepoint：发起安全点后，其他线程要走到轮询点才能全体停下，一个人卡住全体等待。量化靠 safepoint 日志：JDK 8 的 PrintSafepointStatistics 看 sync 列，11+ 的 -Xlog:safepoint 看 Reaching 一列。能补“async-profiler 的 wall-clock 模式可以抓到被冻结线程的等待栈”，加分。</p>
+</details>
+<details>
+<summary>追问二：CFS 限流的机制是什么？在毛刺上是什么指纹？</summary>
+<p><strong>考察意图：</strong>容器视野，能不能把内核调度行为和业务指标连起来。</p>
+<p><strong>答到什么程度算过关：</strong>CFS 按周期（默认 100ms）给配额，配额用尽该周期内整个 cgroup 被冻结到下个周期——多线程 JVM 尤其吃亏，因为配额是全容器共享的。指纹：尖刺贴近整百毫秒网格、伴随突发 CPU；证据是 cpu.stat 的 nr_throttled / throttled_usec（或 K8s 的 throttled periods 指标）。解法方向：提高 limit、让 limit 等于 request、或 CPU Manager 静态绑核。能说出“JVM 线程多，更容易在一个周期内瞬间烧完配额”，是真理解。</p>
+</details>
+<details>
+<summary>追问三：JDK 21 的虚拟线程会不会引入新的毛刺来源？</summary>
+<p><strong>考察意图：</strong>版本敏感度——能不能把新特性纳入停顿世界观。</p>
+<p><strong>答到什么程度算过关：</strong>会。最典型的是 pinning：虚拟线程在 synchronized 块内阻塞时会钉住载体线程，池被钉穿后吞吐塌陷、尾延迟尖刺；JDK 21 可用 ReentrantLock 替代长阻塞区的 synchronized、用 jdk.tracePinnedThreads 定位；JDK 24 的 JEP 491 才从根上解决（synchronized 阻塞不再 pin）。能再补一句“海量虚拟线程抬升分配速率，年轻代压力要重估”，满分。</p>
+</details>
+<details>
+<summary>追问四：为什么抓这类毛刺要用 wall-clock 采样，而不是 CPU 采样？</summary>
+<p><strong>考察意图：</strong>采样方法论——知道工具的盲区在哪。</p>
+<p><strong>答到什么程度算过关：</strong>CPU 采样只看到在 CPU 上跑的线程；毛刺时刻的受害线程往往<strong>不在 CPU 上</strong>（在等安全点、等锁、等 IO），CPU 火焰图正好是空的。wall-clock 按墙钟采样，等待栈也能被抓到，所以定位“停顿类”问题用 wall（async-profiler 的 -e wall），定位“算得慢”才用 CPU。能说出两者的适用分界，这题就过关。</p>
+</details>

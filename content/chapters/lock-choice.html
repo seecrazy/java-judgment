@@ -10,19 +10,86 @@
   "company": ["大厂", "中厂"],
   "trigger": "计数器热点、竞争激烈的并发结构、JDK 升级后性能变化",
   "updated": "2026-11",
-  "status": "planned",
+  "status": "done",
   "summary": "锁升级原理背得再熟，也不如一张“竞争强度 × 操作类型”选型表。偏向锁都废弃了，你的答案还在用它吗？",
   "keywords": ["synchronized", "ReentrantLock", "AQS", "LongAdder", "读写锁", "偏向锁", "锁升级", "无锁"]
 }
 chapter-meta-->
-<h2>这一章要解决的生产问题</h2>
-<p>监控埋点计数器用 synchronized Map，压测时成为热点；有人建议换 ConcurrentHashMap，有人建议 LongAdder——你需要的不只是答案，是选型依据。</p>
-<h2>写作中</h2>
-<p>本章正在按样板章结构写作。计划覆盖的判断点：</p>
+<h2 id="scene">工作场景</h2>
+<p>压测环境 5000 QPS 打监控埋点上报接口，P99 从 20ms 涨到 90ms。CPU 才 40%，<code>jstack</code> 里 30 多个线程 BLOCKED，全卡在同一行计数累加上——计数器是 <code>Collections.synchronizedMap</code> 包的 HashMap，全局一把锁。团队分成了三派：换 ConcurrentHashMap、换 LongAdder、锁没问题只要缩小临界区。可选路径：</p>
 <ul>
-  <li>竞争强度三档选型：低竞争 synchronized（JIT 优化后足够）、高竞争读多写少 LongAdder/读写锁、需要条件队列/可中断/超时才上 AQS 系</li>
-  <li>版本边界：偏向锁 JDK 15 起废弃——旧面试题的“锁升级全链路”答案需要按版本重述</li>
-  <li>JIT 的礼物与陷阱：锁消除/粗化什么时候让你白忙一场（在无竞争代码上优化锁）</li>
-  <li>被否决选项的胜场：ReentrantLock 的 tryLock 超时在“避免死等”场景不可替代</li>
-  <li>面试信号：按“竞争强度 → 数据结构 → 版本”三层作答，而不是复述锁升级流程</li>
+  <li>A. 换 ConcurrentHashMap，用 merge 做计数</li>
+  <li>B. 每个指标一个 LongAdder，容器仍用 ConcurrentHashMap</li>
+  <li>C. 保留 synchronized，把临界区缩到最小</li>
+  <li>D. 上 ReentrantReadWriteLock</li>
 </ul>
+
+<h2 id="framework">判断框架</h2>
+<h3>第一步 · 约束</h3>
+<p>环境 JDK 17。读写画像必须先钉死：这是<strong>写多读少</strong>——每个请求写十几次，报表每 10 秒才读一次；读的语义要求是“统计口径对”，不要求瞬时精确。埋点在请求路径上，任何方案不能引入新的阻塞点，也不能改变上报失败不影响主流程的原则。</p>
+<h3>第二步 · 关键认知</h3>
+<p>锁选型的第一维度不是“哪个锁更高级”，是<strong>竞争强度 × 操作类型</strong>。更要紧的认知：这个场景的正确答案根本不是一把更好的锁——计数是“写-写冲突但不关心瞬时精确值”的操作，LongAdder 的分段思想（base + Cell 数组，竞争时各写各的格）把一个热点拆成几十个，牺牲 sum() 的原子快照换写吞吐，与埋点需求严丝合缝。版本边界也要先立住：偏向锁 JDK 15 起默认禁用并废弃（JEP 374），现在谈锁升级，链路里没有“偏向”这一站了。</p>
+<h3>第三步 · 选项与代价</h3>
+<p>A CHM：桶级并发解决了 map 层的竞争，但热点 key 的计数仍是单点 CAS，高竞争下自旋重试白烧 CPU——比 synchronized 好一档，没到终点。B LongAdder：写吞吐最高；代价是 sum() 非原子快照（读的瞬间有并发写则介于中间态）、每个指标一个对象有少量内存开销——对 10 秒读一次的报表可忽略。C 缩小临界区：从锁整个 map 改成锁单个 key 或 CHM.compute，竞争降一个数量级，但热点 key 仍然串行，天花板明显。D 读写锁：写多读少时读锁帮不上任何忙，状态维护还比监视器锁更重——方向就反了。顺带一个 JIT 提醒：在无竞争代码上花力气“优化锁”可能白忙——逃逸分析判定对象不逃逸时锁会被直接消除，优化必须发生在实测有竞争的地方。</p>
+<h3>第四步 · 押注与复盘</h3>
+<p>选 B：<code>ConcurrentHashMap&lt;String, LongAdder&gt;</code>。回放同 5000 QPS：P99 从 90ms 回到 22ms（基线 20ms），jstack 里 BLOCKED 清零，CPU 从 40% 降到 33%。复盘沉淀两条：团队约定“<strong>纯计数一律 LongAdder，需要瞬时精确才 AtomicLong 或加锁</strong>”；锁竞争问题的排查入口固定为 jstack BLOCKED 聚类——先看竞争强度，再谈选型。</p>
+<h3>被否决选项的胜场</h3>
+<p>ReentrantLock 这次没上，但它的胜场很硬：需要 <code>tryLock</code> 超时避免死等（任务编排、带停机窗口的锁）、可中断获取、多个 Condition 分队列唤醒——这些 synchronized 给不了，“避免级联卡死”的场景它是唯一解。synchronized 本身更是低竞争场景的首选：JIT 锁消除/粗化加持、无竞争获取近乎免费、不会忘 unlock。读写锁的胜场是真正的读多写少 + 读临界区大（配置快照类）；写多读少时它两头不讨好。</p>
+
+<h2 id="desk">回到工位</h2>
+<div class="desk">
+<p><strong>明天上班，先找出你代码里真正的竞争点，再对表选型。</strong></p>
+<p>① 找热点：<code>jcmd &lt;pid&gt; Thread.print | grep -B 1 -A 5 BLOCKED</code>，生产/压测各抓三份，BLOCKED 聚在同一行的才是真竞争——大部分 synchronized 一辈子无竞争，不用动。</p>
+<p>② 对这张表选型，选完在代码旁写一行依据：</p>
+<table>
+  <tr><th>场景</th><th>首选</th><th>依据 / 陷阱</th></tr>
+  <tr><td>低竞争、临界区小</td><td>synchronized</td><td>JIT 优化充分，不会忘 unlock</td></tr>
+  <tr><td>计数 / 统计</td><td>LongAdder</td><td>分段 CAS 写吞吐最高；sum() 非原子快照</td></tr>
+  <tr><td>需要瞬时精确的单值</td><td>AtomicLong</td><td>单点 CAS，高竞争下自旋烧 CPU</td></tr>
+  <tr><td>读多写少、读临界区大</td><td>读写锁 / CopyOnWrite 系</td><td>读不互斥；写频繁则复制成本爆炸</td></tr>
+  <tr><td>要超时 / 可中断 / 多条件队列</td><td>ReentrantLock</td><td>tryLock、lockInterruptibly、Condition</td></tr>
+</table>
+<p>③ 选型前自问一句话：“这个数需要瞬时精确吗？”限流阈值判断、序号发放必须精确，用 AtomicLong；埋点报表容忍误差，LongAdder。方向答错，性能差一个量级。</p>
+</div>
+
+<h2 id="interview">面试怎么答</h2>
+<h3>面试官的三种问法</h3>
+<ul>
+  <li>“synchronized 和 ReentrantLock 怎么选？”（一面基础位）</li>
+  <li>“高并发计数器用什么？为什么不用 AtomicLong？”（区分度最高的一问）</li>
+  <li>“讲讲锁升级的过程。”（考版本边界，埋着偏向锁的坑）</li>
+</ul>
+<h3>好回答的结构</h3>
+<p>先问竞争强度和操作类型，再报 JDK 版本，最后给自己的选择配一句“没选 X 因为 Y”——<strong>竞争强度 → 数据结构 → 版本边界</strong>三层作答，而不是复述锁升级流程。</p>
+<blockquote><p>60 秒示范：“我们埋点计数器原来用 synchronizedMap，5000 QPS 压测 P99 从 20ms 涨到 90ms，jstack 里 30 多个线程 BLOCKED 在同一行累加上。我没换更高级的锁，换的是数据结构：ConcurrentHashMap 套 LongAdder，写竞争被拆到多个 Cell，P99 回到 22ms，BLOCKED 清零。AtomicLong 没选，因为单点 CAS 在高竞争下自旋白烧 CPU，而埋点 10 秒读一次、容忍误差，LongAdder 的非原子 sum 正好够用——限流阈值那种要瞬时精确的地方我们才用 AtomicLong。synchronized 在这里出局是因为全局一把锁串行，但低竞争的业务锁我们仍然用它，不会忘 unlock。版本上我们是 JDK 17，偏向锁从 15 起默认禁用，所以锁升级只讲轻量级到重量级，老答案里偏向那段要打上版本标签。”</p></blockquote>
+<h3>翻车回答</h3>
+<ul>
+  <li>把锁升级背成万年不变的流程，不知道偏向锁 JDK 15 起废弃——版本边界失分。</li>
+  <li>“ReentrantLock 功能多所以更高级”——功能多不等于该用，记不住 unlock 是真风险。</li>
+  <li>“AtomicLong 和 LongAdder 差不多”——说不清 sum() 的原子快照差异，等于没懂。</li>
+  <li>在无竞争代码上谈锁优化——锁消除会让这番努力白忙一场。</li>
+</ul>
+<p class="drill-hint">AI 破绽自查：AI 能把锁升级流程背得比你熟，但给不出“5000 QPS、30 个 BLOCKED、P99 90ms 到 22ms”这种你自己的数字，也没有“限流要精确所以那边仍用 AtomicLong”的对照。</p>
+
+<h2 id="drill">追问链</h2>
+<p class="drill-hint">先自己心里答 10 秒，再展开对照。</p>
+<details>
+<summary>追问一：LongAdder 为什么快？什么场景不能用它？</summary>
+<p><strong>考察意图：</strong>是否理解分段思想与语义取舍，而不是只记结论。</p>
+<p><strong>答到什么程度算过关：</strong>base + Cell 数组：无竞争时 CAS base，出现竞争后线程散到不同 Cell，热点被摊薄；代价是 sum() 遍历累加、非原子快照，Cell 还有内存填充开销。不能用：需要瞬时精确值的场景——限流计数判断阈值、序号发放，多线程加错一个数就是超卖或误放行，必须 AtomicLong 或加锁。能补一句“LongAdder 是 JDK 8 加入、专为高并发统计计数设计的”，更好。</p>
+</details>
+<details>
+<summary>追问二：偏向锁为什么被废弃？“锁升级”现在怎么讲？</summary>
+<p><strong>考察意图：</strong>版本边界与原理能否结合。</p>
+<p><strong>答到什么程度算过关：</strong>JEP 374，JDK 15 起默认禁用并废弃：撤销偏向需要 safepoint，现代高并发应用里偏向的收益覆盖不了撤销成本，还与 hashCode、CAS 等原语互相牵制。现在的链路：无竞争 CAS（轻量级锁）→ 自旋失败膨胀为重量级监视器锁。答题时主动给老答案打版本标签，说明知识有保鲜期意识，这题就从扣分题变加分题。</p>
+</details>
+<details>
+<summary>追问三：读写锁什么时候反而比 synchronized 慢？</summary>
+<p><strong>考察意图：</strong>是否真理解读写锁的代价模型，而不是“读多就用它”的口诀。</p>
+<p><strong>答到什么程度算过关：</strong>两个条件任一满足就别用：写多读少（读锁帮不上忙，还多一层读写状态维护）；读临界区极小（锁开销大于临界区本身，分离读的收益覆盖不了成本）。读写锁的甜区是读远多于写且读临界区大。加分：提到锁降级模式——写锁内先拿读锁再释放写锁，是缓存刷新的安全写法。</p>
+</details>
+<details>
+<summary>追问四：synchronizedMap、ConcurrentHashMap、ConcurrentSkipListMap 怎么选？</summary>
+<p><strong>考察意图：</strong>并发容器是否成体系，选型维度是否一致。</p>
+<p><strong>答到什么程度算过关：</strong>synchronizedMap 全局一把锁，只适合低竞争或只读为主；CHM 桶级并发（CAS + 桶内 synchronized），哈希表默认首选；需要有序遍历、范围查询才用 ConcurrentSkipListMap，用更低吞吐换有序。答案要落在“竞争强度 + 是否需要有序”两个维度上，与前一张选型表同构。</p>
+</details>

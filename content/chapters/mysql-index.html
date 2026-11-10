@@ -10,19 +10,98 @@
   "company": ["大厂", "中厂"],
   "trigger": "慢查询告警、列表页深翻页慢、新表索引评审",
   "updated": "2026-11",
-  "status": "planned",
+  "status": "done",
   "summary": "加索引解决一半慢查询，另一半要靠改写业务（游标翻页、覆盖索引、延迟关联）。会判读 explain 是底线，敢删索引是高级。",
   "keywords": ["索引", "explain", "回表", "覆盖索引", "联合索引", "深翻页", "慢查询", "写放大"]
 }
 chapter-meta-->
-<h2>这一章要解决的生产问题</h2>
-<p>运营后台导出列表，翻到 50 万页时一条 SQL 跑 8 秒拖垮从库。索引都建了——问题不在“有没有索引”，在访问模式本身。</p>
-<h2>写作中</h2>
-<p>本章正在按样板章结构写作。计划覆盖的判断点：</p>
+<h2 id="scene">工作场景</h2>
+<p>订单表 1.2 亿行，MySQL 8.0 主从。周三下午运营反馈后台列表“翻不动了”，慢日志里 <code>SELECT * FROM orders WHERE status=2 ORDER BY id DESC LIMIT 10000000, 20</code>——第 50 万页——跑了 8.2 秒：offset 要沿索引产出 1000 万行再丢掉。这条查询打满从库 IO，报表服务一起被拖下水。而 <code>(status, id)</code> 联合索引本来就躺在表上。可选路径：</p>
 <ul>
-  <li>explain 判读次序：type → rows → Extra（Using filesort / Using index）——先判断“优化器想干什么”再动手</li>
-  <li>深翻页的正确解：游标（where id &gt; last_id limit n）、延迟关联、覆盖索引——业务改写常常优于索引堆砌</li>
-  <li>联合索引的最左原则与区分度排序；索引失效清单（函数、隐式转换、前导 %）之外——“索引太多”的写放大代价</li>
-  <li>被否决选项的胜场：为运营低频查询建索引拖累主链路写入时，“从库+错峰”比索引更对</li>
-  <li>面试信号：敢说“我们删了三个没用的索引，写入 P99 降了”就是经历过的人</li>
+  <li>A. 继续加索引：建一个覆盖列表全部字段的联合索引</li>
+  <li>B. 纯 SQL 改写：延迟关联，先查 id 再回表取那 20 行</li>
+  <li>C. 业务改写：列表改游标翻页，全量导出改异步任务</li>
+  <li>D. 运营查询限流 + 独立从库，先隔离再说</li>
 </ul>
+
+<h2 id="framework">判断框架</h2>
+<h3>第一步 · 约束</h3>
+<p>主库写入 SLA：P99 50ms 不能动，白天峰值 4500 写 QPS；运营列表日均使用 200 次，是低频后台需求；从库同时服务报表，不能被单条大查询独占。改交互要产品排期，一周内能动 SQL 和配置——这是“技术侧先止血、业务侧跟上”的典型约束组合。</p>
+<h3>第二步 · 关键认知</h3>
+<p>explain 判读有固定次序：<strong>type → rows → Extra</strong>。这条 SQL 的 explain 是 type=ref、rows≈1000 万、Extra=Using index——优化器没选错，<code>(status, id)</code> 已经免回表地按 id 倒序吐数据；问题是 offset 语义要求它<strong>产生并丢弃前 1000 万行</strong>。这是“有没有索引”和“该不该这么查”的分界线：索引救不了访问模式。</p>
+<h3>第三步 · 选项与代价</h3>
+<p>A 覆盖索引要塞进列表全部 12 个字段，索引比表还宽：主库每秒 4500 次写入全部背上写放大，等于拿主链路的钱买后台的爽。B 延迟关联把回表压到 20 次，但沿二级索引数 1000 万行免不了，8 秒变 4 秒，没有质变。C 游标翻页 <code>WHERE id &lt; last_id ORDER BY id DESC LIMIT 20</code> 直接定位，毫秒级；代价是“跳到第 N 页”没了，要和产品谈。D 治标：隔离该做，但查询本身是错的这一点没变。</p>
+<h3>第四步 · 押注与复盘</h3>
+<p>押 C：列表改游标 + 筛选条件收窄，全量导出改异步任务走独立从库。三天上线，列表接口从 8.2s 到 6ms；导出进队列后从库 IO 峰值降 60%。顺手用 <code>sys.schema_unused_indexes</code> 挖出 3 个半年没人用的索引删掉，主库写入 P99 从 45ms 回到 28ms——<strong>删索引比加索引更需要证据</strong>，写放大的账平时没人算。</p>
+<h3>被否决选项的胜场</h3>
+<p>这次否决了“再加索引”，但加索引在另一种场景就是正解：C 端高频链路的等值查询（用户查自己的订单），一个区分度高的 <code>(user_id, status, created_at)</code> 联合索引是教科书答案——高频、读多写少、字段收敛，写放大换查询延迟是划算的。延迟关联也不是废物：offset 在十万级以内、交互不能动的场景，它是不改业务的纯 SQL 最优解。否决它们不是它们错，是<strong>这次的病灶在访问模式，不在索引结构</strong>。</p>
+<pre class="mermaid">
+flowchart TD
+  A["慢查询告警"] --> B["explain：type → rows → Extra"]
+  B --> C{"索引选错了吗？"}
+  C -- "type=ALL / rows 远超语义所需" --> D["补或改联合索引，先排查失效三件套"]
+  C -- "索引已最优，rows=offset 决定" --> E{"访问模式本身合理吗？"}
+  E -- "深翻页 / 全量拉取" --> F["业务改写：游标翻页 / 异步导出，找产品谈交互"]
+  E -- "合理的高频查询" --> G["覆盖索引或延迟关联，先算写放大的账"]
+  F --> H["顺手删冗余索引，还主库写入"]
+  G --> H
+</pre>
+
+<h2 id="desk">回到工位</h2>
+<div class="desk">
+<p><strong>明天上班三步，对着你们自己的慢日志：</strong></p>
+<ol>
+  <li>确认慢日志阈值：<code>long_query_time</code> 默认 10 秒太宽，调到 0.5，再用 <code>pt-query-digest</code> 取 Top 3 慢 SQL。</li>
+  <li>逐条 <code>EXPLAIN</code>，按 <strong>type → rows → Extra</strong> 次序判读，对号入座：
+    <table>
+      <tr><th>explain 特征</th><th>含义</th><th>第一动作</th></tr>
+      <tr><td>type=ALL、rows≈全表</td><td>全表扫描</td><td>补/改索引，先查失效三件套：函数包裹列、隐式类型转换、前导 %</td></tr>
+      <tr><td>type=ref/index 但 rows=offset 量级</td><td>索引没选错，访问模式错了</td><td>游标 / 延迟关联 / 异步导出，停止堆索引</td></tr>
+      <tr><td>Using filesort</td><td>排序没吃到索引</td><td>联合索引重排：等值列在前、区分度高者优先、排序列殿后</td></tr>
+      <tr><td>Using index</td><td>覆盖索引免回表</td><td>算写放大的账，确认值这份数据拷贝</td></tr>
+    </table>
+  </li>
+  <li>跑 <code>sys.schema_unused_indexes</code> 和 <code>sys.schema_redundant_indexes</code>，拿候选删减名单找 DBA 复核（观察期要覆盖月结和大促回溯，唯一约束索引除外）。<strong>要问产品的一句话：“这个列表真的有人翻到第 50 万页，还是其实只想要筛选和导出？”</strong>——这一句决定你花两天改交互，还是花两个月堆索引。</li>
+</ol>
+</div>
+
+<h2 id="interview">面试怎么答</h2>
+<h3>面试官的三种问法</h3>
+<ul>
+  <li>“explain 你主要看哪几个字段？”（一面标配，考判读次序，不是背全字段）</li>
+  <li>“列表页翻到几十万页很慢，怎么办？”（考深翻页的三层解法与取舍）</li>
+  <li>“你们线上索引怎么治理？”（高级岗分水岭：敢不敢删、怎么算写放大）</li>
+</ul>
+<h3>好回答的结构</h3>
+<p>先给判读次序（说明有方法论），再讲“索引已最优但访问模式错误”这个案例，落到业务改写和索引治理两个动作。索引失效清单放最后当补充，不当主菜。</p>
+<blockquote><p>60 秒示范：“1.2 亿行订单表，后台列表 LIMIT 10000000, 20 跑 8.2 秒拖垮从库。我先 explain：type=ref、Extra=Using index——索引已经最优，(status, id) 免回表，问题是 offset 要产生并丢弃 1000 万行，这不是索引能救的。所以答案是业务改写：列表改游标 where id &lt; last_id，6ms 返回；全量导出改异步走独立从库，从库 IO 峰值降 60%。加宽索引我评估过没做——为日均 200 次的后台查询，让主库 4500 写 QPS 背 12 个字段的写放大，不划算。事后还删了 3 个没人用的索引，主库写入 P99 从 45ms 降到 28ms。”</p></blockquote>
+<h3>翻车回答</h3>
+<ul>
+  <li>把“索引失效十大场景”背三分钟——那是清单不是判断，面试官立刻追问“失效之外呢”。</li>
+  <li>深翻页只答“加索引”或“加缓存”——等于承认没 explain 过这条 SQL。</li>
+  <li>“索引越多越好”或反之——两个方向都没算写放大的账，都是拍脑袋。</li>
+</ul>
+<p class="drill-hint">AI 破绽自查：AI 会把游标、延迟关联、覆盖索引各写一段谁也不得罪。你的回答必须有“我们选了哪个、没做哪个、写入 QPS 是多少”。</p>
+
+<h2 id="drill">追问链</h2>
+<p class="drill-hint">先自己心里答 10 秒，再展开对照。</p>
+<details>
+<summary>追问一：联合索引 (status, id) 明明存在，为什么深翻页还是慢？</summary>
+<p><strong>考察意图：</strong>分清“索引选错”和“访问模式错误”——本章的核心分界线。</p>
+<p><strong>答到什么程度算过关：</strong>能讲出执行路径：二级索引按 (status, id) 有序且 Using index 免回表，但 offset 1000 万意味着引擎必须沿索引产出 1000 万零 20 条再丢掉前面——扫描量由语义决定，不是优化器选错。解法只剩两类：减少扫描（游标把定位变成 B+ 树一次下沉，O(log n + n)）或减少产出（延迟关联把回表压到 20 次但数行免不了）。能补一句“rows 是采样估算，真实行数用 8.0.18+ 的 EXPLAIN ANALYZE 对比”更好。</p>
+</details>
+<details>
+<summary>追问二：删索引你怎么敢的？怎么证明它没在用？</summary>
+<p><strong>考察意图：</strong>写放大量化与变更安全——敢删，且删得有依据。</p>
+<p><strong>答到什么程度算过关：</strong>证据链三层：performance_schema.table_io_waits_summary_by_index_usage（或 sys.schema_unused_indexes）观察至少一个完整业务大周期，含月结和大促；redundant 检查是否被更长联合索引的左前缀覆盖；先从库后主库、留回滚 DDL。代价侧要能报数：每个二级索引是一份独立数据拷贝，写入要维护全部索引，buffer pool 还得装下它们的热页——我们删 3 个，写入 P99 从 45ms 到 28ms。再声明边界：唯一索引和约束索引不进删减名单。</p>
+</details>
+<details>
+<summary>追问三：游标翻页的代价是什么？产品非要“跳到第 N 页”怎么办？</summary>
+<p><strong>考察意图：</strong>知道每个方案的边界，且能把技术约束翻译成产品语言。</p>
+<p><strong>答到什么程度算过关：</strong>三个限制：只能顺序翻；续拨字段必须唯一且稳定（不唯一就 (sort_col, id) 双条件续拨）；按非索引字段排序时游标失效。产品坚持跳页的组合拳：跳页场景交 ES 或搜索服务（本来就不该拿 MySQL 干）；或限制最大页数——Google 也只给几十页。点题一句：这不是妥协，是把“无限深翻页”这个伪需求拆穿——没人真翻到第 50 万页，用户要的是筛选和导出。</p>
+</details>
+<details>
+<summary>追问四：explain 的 rows 和真实执行行数差了 10 倍，怎么回事？</summary>
+<p><strong>考察意图：</strong>统计信息认知——优化器不是神，以及 8.0 的修法。</p>
+<p><strong>答到什么程度算过关：</strong>rows 是基于采样页的基数估算不是实测；表大、数据倾斜、大批量导入后都会飘。动作顺序：ANALYZE TABLE 重采样；倾斜列用 8.0 直方图（ANALYZE TABLE ... UPDATE HISTOGRAM ON 列）帮优化器；仍选错索引才考虑 force index，并留注释说明统计信息背景。能把“先修统计信息再改 SQL”这个顺序说成纪律，过关。</p>
+</details>

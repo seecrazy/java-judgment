@@ -10,19 +10,106 @@
   "company": ["大厂", "中厂"],
   "trigger": "RSS 持续上涨但堆监控正常、容器 OOMKilled、Netty/DirectByteBuffer 使用方",
   "updated": "2026-11",
-  "status": "planned",
-  "summary": "堆监控一切正常，进程 RSS 却一路涨到被容器 OOMKilled。OOM 不一定是堆——堆外内存的定位链路完全不同。",
+  "status": "done",
+  "summary": "堆平稳但 RSS 每天涨 300MB，最终 OOMKilled。先分清哪层内存：差值、pmap、线程栈逐层排除，落到 Netty 漏 release。附 OOM 分诊表。",
   "keywords": ["OOM", "堆外内存", "DirectByteBuffer", "Netty", "NMT", "元空间", "OOMKilled"]
 }
 chapter-meta-->
-<h2>这一章要解决的生产问题</h2>
-<p>网关服务堆用量平稳，容器内存却每周稳定上涨，最终被 K8s OOMKilled。jmap 看堆干干净净——问题根本不在堆里。</p>
-<h2>写作中</h2>
-<p>本章正在按样板章结构写作（场景 → 判断框架 → 回到工位 → 面试怎么答 → 追问链）。计划覆盖的判断点：</p>
+<h2 id="scene">工作场景</h2>
+<p>Netty 网关，堆 8G、用量常年 45%，GC 平稳，jmap 看堆干干净净。但容器 RSS 每天稳定涨 300MB，两周内三次凌晨被 K8s OOMKilled（exit 137，Java 日志里连一行 OutOfMemoryError 都没有）。当晚还有流量高峰，不能随意停机。可选路径：</p>
 <ul>
-  <li>OOM 的分类学：堆 / 元空间 / 直接内存 / 栈 / 容器 cgroup——先分清是哪种，再谈定位</li>
-  <li>DirectByteBuffer 为什么不受 GC 直接管理（引用计数 vs GC 感知），Netty PoolArena 与 <code>-XX:MaxDirectMemorySize</code> 的关系</li>
-  <li>诊断链路：NMT（<code>jcmd VM.native_memory</code>）、pmap、按段排除（glibc arena / 线程栈 / CodeCache）</li>
-  <li>被否决选项的胜场：“重启大法”作为止血手段的正当性与限度</li>
-  <li>面试分层信号：能说出“OOM 不一定是堆”是分水岭，能讲 NMT baseline 对比是加分</li>
+  <li>A. 调大容器内存 limit，先扛住再说</li>
+  <li>B. 上线定时滚动重启，把“死”变成计划动作</li>
+  <li>C. dump 一份堆用 MAT 分析——毕竟是“内存泄漏”</li>
+  <li>D. 先分清是哪一层内存：cgroup 差值、pmap、线程栈逐层排除</li>
 </ul>
+
+<h2 id="framework">判断框架</h2>
+<h3>第一步 · 约束</h3>
+<p>入口网关，高峰不能重启，更不能 dump（停顿会打断所有转发）。容器 limit 12G、-Xmx8G，JDK 17，Netty 4.1，监控只画了堆和 RSS 两条线。先把第一个事实钉死：<strong>OOMKilled 是 cgroup 的内核行为，进程被 SIGKILL，Java 层没有任何异常</strong>——这直接排除堆 OOM，问题在堆外。这一步零成本，却砍掉一半错误答案。</p>
+<h3>第二步 · 关键认知</h3>
+<p>JVM 进程内存 ≠ 堆。RSS ≈ 堆 + 元空间 + 线程数×Xss + CodeCache + 直接内存 + native（压缩库、JNI、glibc arena）。OOM 是个分类学问题：堆看 GC 日志与 dump，元空间看 ClassLoader 数量，直接内存看 BufferPool 与 Netty 泄漏检测，native 只能 pmap / NMT 兜底。分不清层就选工具，查一晚上也是白查。</p>
+<h3>第三步 · 选项与代价</h3>
+<p>A 调大 limit：泄漏还在，只是死得慢，且掩盖增长率。B 滚动重启：止血合法，但会让人忘掉病灶，泄漏速率一翻倍（大促流量）就穿帮。C dump：堆是干净的，dump 只会得到“无发现”三个字，还白付一次停顿和 8G 落盘。D 分层排除：零变更、全只读，代价是要会读——按层走完最多两小时。</p>
+<h3>第四步 · 押注</h3>
+<p>选 D，当晚四层走完：①差值——cgroup 用量减堆 committed，每天 +300MB，堆外实锤；②线程——jstack 统计 420 个线程稳定，排除线程栈；③元空间与 CodeCache——arthas memory 一眼平稳，排除；④pmap 间隔一小时两次对比——匿名段按 16MB 步长涨，正好是 Netty 池的默认 chunk 大小。一个关键坑：Netty 默认走 Unsafe 分配直接内存，JDK 的 direct 统计看不到它（以你们 Netty 版本与配置为准），所以 BufferPool 干净不代表没漏。定位动作：下个发布把 io.netty.leakDetection.level 从默认 SIMPLE 提到 SAMPLED，灰度当天打出 LEAK: ByteBuf.release() was not called——两周前新加的透传 handler 有个 catch 分支漏了 release。当晚止血选 B，滚动重启排进计划并盯紧差值曲线——这是止血，不是修复。</p>
+<h3>第五步 · 复盘</h3>
+<p>修复上线后 RSS 走平。沉淀三条：容器内存三本账（堆 / JVM 非堆 / native）监控缺一不可，这次缺的就是差值曲线；-XX:MaxDirectMemorySize 显式设置（不设时默认约等于 Xmx）；Netty 服务泄漏检测 SAMPLED 常开、PARANOID 只进预发。</p>
+<h3>被否决选项的胜场</h3>
+<p>dump + MAT 在<strong>堆内泄漏</strong>（静态集合、ThreadLocal 没删、ClassLoader 泄漏）上就是标准答案，这次否决它只因堆是干净的。调大 limit 在<strong>容量真实增长</strong>（业务上量而非泄漏）时是正解。滚动重启在“泄漏慢、无诊断窗口、高峰不能碰”的约束下是诚实且专业的选择——前提是配增长趋势告警和修复排期，否则等于把事故藏进例行公事。</p>
+<pre class="mermaid">
+flowchart TD
+  A["进程内存上涨 / OOM"] --> B{"Java 侧有 OutOfMemoryError 吗？"}
+  B -- "没有，进程直接消失" --> C["cgroup OOMKilled：看 K8s 事件与 dmesg"]
+  B -- "有" --> D{"异常是哪一种？"}
+  D -- "Java heap space" --> E["堆：GC 日志，低峰 dump + MAT"]
+  D -- "Metaspace" --> F["元空间：ClassLoader 数量趋势"]
+  D -- "Direct buffer memory" --> G["直接内存：BufferPool 与 Netty 泄漏检测"]
+  D -- "unable to create new native thread" --> H["线程：jstack 趋势与 ulimit"]
+  C --> I["堆外分层排除：差值，线程栈，pmap 增量，NMT diff"]
+  I --> J{"增长段对上谁？"}
+  J -- "16MB 步长" --> K["Netty 池化直接内存：开泄漏检测"]
+  J -- "64MB 步长" --> L["glibc arena：MALLOC_ARENA_MAX 或换分配器"]
+  J -- "随线程数涨" --> M["线程栈：查线程池泄漏或调 Xss"]
+  J -- "都对不上" --> N["第三方 native：jemalloc profiling"]
+</pre>
+
+<h2 id="desk">回到工位</h2>
+<div class="desk">
+<p><strong>给自己的服务补三件堆外可见性，再做一次分诊演练：</strong></p>
+<ol>
+  <li>画差值曲线：容器内存用量（K8s 里 container_memory_working_set_bytes）减去堆 committed。这条曲线就是本次事故唯一缺的监控，今天就能加上。</li>
+  <li>只读命令走一遍：jcmd &lt;pid&gt; VM.native_memory summary（要启动参数 -XX:NativeMemoryTracking=summary，有个位数百分比开销，建议预发常开、生产按需）；pmap -x &lt;pid&gt; | sort -k3 -rn | head -20 间隔一小时跑两次比增量；jstack &lt;pid&gt; | grep -c '^"' 得线程数，乘 -Xss 就是线程栈账本。</li>
+  <li>Netty 服务逐项确认：泄漏检测级别是不是还停在默认 SIMPLE；-XX:MaxDirectMemorySize 有没有显式设置。两个都不是的话，写进下次发布的启动参数。</li>
+</ol>
+<p>把这张<strong>OOM 分诊表</strong>贴进团队文档：</p>
+<table>
+  <tr><th>现象</th><th>层</th><th>证据手段</th><th>第一动作</th></tr>
+  <tr><td>OutOfMemoryError: Java heap space</td><td>堆</td><td>GC 日志、jstat</td><td>低峰 dump + MAT</td></tr>
+  <tr><td>OutOfMemoryError: Metaspace</td><td>元空间</td><td>ClassLoader 数量趋势</td><td>查动态代理、脚本引擎</td></tr>
+  <tr><td>OutOfMemoryError: Direct buffer memory</td><td>直接内存</td><td>BufferPool 指标、Netty 检测</td><td>找漏 release，设显式上限</td></tr>
+  <tr><td>OutOfMemoryError: unable to create new native thread</td><td>线程 / ulimit</td><td>jstack 线程数趋势</td><td>查线程池泄漏</td></tr>
+  <tr><td>进程消失、exit 137、无 Java 异常</td><td>cgroup</td><td>K8s events、dmesg</td><td>走堆外分层排除链</td></tr>
+</table>
+</div>
+
+<h2 id="interview">面试怎么答</h2>
+<h3>面试官的三种问法</h3>
+<ul>
+  <li>“内存泄漏怎么排查？”（一面标配，先看你分不分诊）</li>
+  <li>“堆监控正常，容器却被 OOMKilled，你怎么查？”（本题，考层次感）</li>
+  <li>“DirectByteBuffer / Netty 为什么会泄漏？”（二面，考原理）</li>
+</ul>
+<h3>好回答的结构</h3>
+<p>先分诊（哪种 OOM）→ 再分层（堆外哪一层）→ 证据（具体命令与输出）→ 修复（代码位）→ 复盘（补了哪条监控）。高级感来自你<strong>砍掉了什么</strong>，不是罗列了多少工具。</p>
+<blockquote><p>60 秒示范：“Netty 网关，堆 8G 稳定在 45%，RSS 却每天涨 300MB，两周内三次凌晨被 OOMKilled，Java 侧没有任何异常——这直接说明死因在堆外。我按层排除：cgroup 差值确认堆外每天 +300MB；jstack 看 420 个线程稳定，排除线程栈；pmap 两次对比，匿名段按 16MB 步长涨，正好是 Netty 池的默认 chunk 大小；把泄漏检测从 SIMPLE 提到 SAMPLED 后抓到 LEAK 日志，是两周前新加的透传 handler 在一个 catch 分支漏了 release。当晚用滚动重启止血，一周后版本修复，差值曲线走平。dump 我评估过没做——堆是干净的，dump 只会白付一次停顿。”</p></blockquote>
+<h3>翻车回答</h3>
+<ul>
+  <li>上来就“dump 堆用 MAT 分析”——没有分诊，方向就错了，堆外泄漏 dump 什么都看不到。</li>
+  <li>“调大 MaxDirectMemorySize 就好了”——把保险丝调粗不等于修电路，反而丢掉最后一道报警。</li>
+  <li>说不出 OOMKilled 的两个特征（exit 137、无 Java 异常）——等于没碰过容器里的 JVM。</li>
+</ul>
+<p class="drill-hint">AI 破绽自查：你的回答里有没有 16MB、300MB、420 线程这种只有现场才有的数字，和一句“dump 我评估过没做”？</p>
+
+<h2 id="drill">追问链</h2>
+<p class="drill-hint">先自己心里答 10 秒，再展开对照。</p>
+<details>
+<summary>追问一：NMT 的 baseline 和 diff 怎么用？它有什么看不到的？</summary>
+<p><strong>考察意图：</strong>是真用过 NMT，还是只背得出命令名。</p>
+<p><strong>答到什么程度算过关：</strong>启动参数开 -XX:NativeMemoryTracking=summary，jcmd VM.native_memory baseline 打基准，复现一段时间后用 VM.native_memory.diff 看哪一类 Commit 在涨。更深一层必须说出局限：NMT 只记 JVM 自己申请的内存，第三方 native（压缩库、JNI、glibc arena、Netty 走 Unsafe 的分配）不在账内——NMT 干净不等于没泄漏，要 pmap 兜底。能补一句“开销个位数百分比，生产常开要评估”，满分。</p>
+</details>
+<details>
+<summary>追问二：DirectByteBuffer 的释放机制是什么？为什么堆很健康反而更容易堆积直接内存？</summary>
+<p><strong>考察意图：</strong>Cleaner 机制，以及“GC 感知”与“引用计数”两套内存管理的分界。</p>
+<p><strong>答到什么程度算过关：</strong>JDK 的 DirectByteBuffer 没有显式 free，靠对象被 GC 回收时触发 Cleaner 释放底层内存——堆没压力、GC 不跑，清理就一直欠着，分配速率大于清理速率就只涨不跌。Netty 池化 ByteBuf 是另一套：引用计数加 release() 显式归还，漏调就是永久滞留。结论要落回工程：显式上限必须设（-XX:MaxDirectMemorySize、Netty 侧对应配置），并且对症下药——GC 欠账靠降分配速率或触发回收，漏 release 只能改代码加检测。</p>
+</details>
+<details>
+<summary>追问三：glibc 的 arena 为什么会让 RSS 虚高？怎么处理？</summary>
+<p><strong>考察意图：</strong>JVM 之外的 native 视野，会不会读进程级内存。</p>
+<p><strong>答到什么程度算过关：</strong>glibc 会按线程源新 arena（64 位下 64MB 一块），高线程数服务的 RSS 会远超实际使用且 free 后不还给操作系统；对策是调小 MALLOC_ARENA_MAX（常见 2~4）或换 jemalloc / tcmalloc（还能顺带做分配 profiling）。能说出“先确认 pmap 增量是不是 64MB 步长再怀疑它”，说明真查过而不是背的。</p>
+</details>
+<details>
+<summary>追问四：容器里的 JVM 内存怎么配，才不会再被 OOMKill？</summary>
+<p><strong>考察意图：</strong>把一次诊断沉淀成容量公式。</p>
+<p><strong>答到什么程度算过关：</strong>limit ≥ Xmx + MaxMetaspaceSize + ReservedCodeCacheSize + 线程数×Xss + MaxDirectMemorySize + native 余量，经验上再留 20%~25% headroom，最终以压测实测 RSS 定稿；同时确认 JVM 是容器感知的（8u191+ 与 10+ 默认感知，更老的 8 要显式处理）。能说出“上线后用差值曲线持续验证”，才算闭环。</p>
+</details>
